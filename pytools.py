@@ -91,8 +91,9 @@ class Tools():
                     self.image_library[name] = image
             return image
 
-    def speak_independently(self, threadName, text):
-        self.speak.Speak(text)
+    def speak_independently(self, threadName, text, featureEnabled = False):
+        if featureEnabled:
+            self.speak.Speak(text)
 
     def set_AI_text(self, text):
         if text == self.AItext:
