@@ -5,6 +5,9 @@ import torch
 from pytools import Tools
 from brain import AI_brain
 
+import cv2
+import pygame.camera
+
 os.environ['SDL_VIDEO_CENTERED'] = '1'
 
 # TO DO
@@ -20,6 +23,7 @@ class Filter(torch.nn.Module):
         self.conv2 = torch.nn.Conv2d(in_channels=3, out_channels=3,kernel_size= 3, padding=1)
         self.conv3 = torch.nn.Conv2d(in_channels=3, out_channels=3,kernel_size= 3, padding=1)
         self.conv4 = torch.nn.Conv2d(in_channels=3, out_channels=3,kernel_size= 3, padding=1)
+        self.relu = torch.nn.ReLU(True)
         self.init = True
         self.layer = None
         self.apply(self.initialize)
@@ -28,9 +32,10 @@ class Filter(torch.nn.Module):
     def forward(self, x):
         x = self.conv(x)
         x = self.conv2(x)
-        self.relu = torch.nn.ReLU(True)
         x = self.conv3(x)
         x = self.conv4(x)
+        # maybe put this in the middle
+
         return x
 
     def initialize(self,m):
@@ -46,6 +51,70 @@ class Filter(torch.nn.Module):
         #convParams = list(self.conv.parameters())
         #convK, convB = convParams
         #print(convK.size(), convB.size())
+
+
+class ListModule(torch.nn.Module):
+    def __init__(self, *args):
+        super(ListModule, self).__init__()
+        idx = 0
+        for module in args:
+            self.add_module(str(idx), module)
+            idx += 1
+
+    def __getitem__(self, idx):
+        if idx < 0 or idx >= len(self._modules):
+            raise IndexError('index {} is out of range'.format(idx))
+        it = iter(self._modules.values())
+        for i in range(idx):
+            next(it)
+        return next(it)
+
+    def __iter__(self):
+        return iter(self._modules.values())
+
+    def __len__(self):
+        return len(self._modules)
+
+class FilterCamera(torch.nn.Module):
+    def __init__(self, c=6,r=3, kernels = 3):
+        super(FilterCamera, self).__init__()
+        self.relu = torch.nn.ReLU(True)
+
+        self.convlist = []
+        self.convlist.append(torch.nn.Conv2d(in_channels=3, out_channels=kernels,kernel_size= 3, padding=1))
+        for i in range(c-2):
+            self.convlist.append(torch.nn.Conv2d(in_channels=kernels, out_channels=kernels,kernel_size= 3, padding=1))
+
+        self.convlist.append(torch.nn.Conv2d(in_channels=kernels, out_channels=3,kernel_size= 3, padding=1))
+        self.conv = ListModule(*self.convlist)
+
+        # Conv1d, then maxpooling conv1d, maxpooling etc
+
+        self.c = c
+        self.r = r
+
+        self.relu = torch.nn.ReLU(True)
+        self.init = True
+        self.layer = None
+        self.apply(self.initialize)
+        self.init = False
+
+    def forward(self, x):
+        c = 0
+        for i in range(self.r*self.c):
+            x = self.convlist[c](x)
+            c = (c + 1) % self.c
+        # maybe put this in the middle
+
+        return self.relu(x)
+
+    def initialize(self,m):
+
+        classname = m.__class__.__name__
+        if classname.find('Conv') != -1:
+            k = 1/(27.0)
+            s = 0.2
+            m.weight.data.normal_(k,s)
 
 
 class SceneBase:
@@ -67,6 +136,78 @@ class SceneBase:
     def Terminate(self):
         self.next = None
 
+
+class Capture(object):
+    def __init__(self):
+        self.cap = cv2.VideoCapture(0)
+
+
+    def get(self):
+        ret, frame = self.cap.read()
+        color = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return color
+
+
+class AugmentedReality(SceneBase):
+
+    def __init__(self, last_scene):
+        super().__init__()
+        self.last_scene = last_scene
+        self.screen = None
+        self.screen_size = None
+        self.capture = Capture()
+        self.next = None
+        self.clock = 20
+        self.filter = FilterCamera().cuda()
+
+    def Begin(self):
+        self.next = self
+        self.screen_size = 640, 480
+        self.screen = pygame.display.set_mode((self.screen_size[0], self.screen_size[1]), pygame.SRCALPHA)
+        return self
+
+    def ProcessEvents(self):
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.Terminate()
+            if event.type == pygame.KEYDOWN:
+                mykey = pygame.key.name(event.key)
+                if mykey == "r":
+                    self.filter.apply(self.filter.initialize)
+
+    def Update(self):
+        self.image = self.capture.get()
+        self.image = self.image.swapaxes(0,2)
+        self.tensor_image = torch.autograd.Variable(torch.from_numpy(self.image)).cuda()
+
+
+        self.e = torch.autograd.Variable(torch.rand((self.screen_size[0], self.screen_size[1], 3))).cuda()
+        self.e2 = torch.autograd.Variable(torch.rand((self.screen_size[0], self.screen_size[1], 3))).cuda()
+        self.e = torch.add(self.e,-0.5)
+        epsilon_distortion = 0 # 0.7
+        self.e = torch.mul(self.e,torch.mul(self.e2,epsilon_distortion))
+
+        self.e = self.e.byte()
+        self.tensor_image = torch.add(self.tensor_image,self.e)
+
+        self.tensor_image = self.tensor_image.float()
+        self.tensor_image = self.tensor_image.unsqueeze(0)
+        self.tensor_image = self.filter(self.tensor_image)
+        self.tensor_image = torch.clamp(self.tensor_image,0,255)
+        self.tensor_image = self.tensor_image.squeeze(0)
+        self.tensor_image = self.tensor_image.data.cpu().numpy()
+        self.tensor_image = self.tensor_image.swapaxes(0,2)
+        self.tensor_image = self.tensor_image.swapaxes(0,1)
+
+
+    def Render(self):
+        self.screen.fill((0, 0, 0))
+        pygame.surfarray.blit_array(self.screen,self.tensor_image)
+
+
+    def Terminate(self):
+        self.next = None
+
 class PhysicsSimulator(SceneBase):
 
     def __init__(self, last_scene):
@@ -80,6 +221,7 @@ class PhysicsSimulator(SceneBase):
         self.s = None
         self.clock = 60
         self.nonrandom = False
+        self.filter = Filter().cuda()
 
     def Begin(self):
 
@@ -90,8 +232,6 @@ class PhysicsSimulator(SceneBase):
 
         self.s = 96, 56
         self.field_matrix = torch.autograd.Variable(torch.abs(torch.rand((self.s[0],self.s[1],3))), volatile=True,requires_grad=False).cuda()
-
-        self.filter = Filter().cuda()
 
         return self
 
@@ -107,7 +247,7 @@ class PhysicsSimulator(SceneBase):
 
         for i in range(self.s[0]):
             for j in range(self.s[1]):
-                motion = 5.0
+                motion = 5
                 pygame.draw.circle(self.screen, (255*t0[i][j][0],255*t0[i][j][1],128*t0[i][j][2]), (2+i*20+int(motion*t0[i][j][0]-motion/2), 2+j*20+int(motion*t0[i][j][1]-motion/2)), int(7*t0[i][j][2])+1, 1)
 
     def Update(self):
@@ -115,7 +255,8 @@ class PhysicsSimulator(SceneBase):
         self.e = torch.autograd.Variable(torch.rand((self.s[0], self.s[1], 3))).cuda()
         self.e2 = torch.autograd.Variable(torch.rand((self.s[0], self.s[1], 3))).cuda()
         self.e = torch.add(self.e,-0.5)
-        self.e = torch.mul(self.e,torch.mul(self.e2,0.7))
+        epsilon_distortion = 0.1 # 0.7
+        self.e = torch.mul(self.e,torch.mul(self.e2,epsilon_distortion))
 
         self.field_matrix = torch.add(self.field_matrix,self.e)
 
@@ -277,19 +418,19 @@ class CyberTerm(SceneBase):
 
 CT = CyberTerm()
 PS = PhysicsSimulator(CT)
-scenes = (CT, PS)
+AR = AugmentedReality(CT)
+scenes = (CT, CT, CT)
 
 def Run():
 
     pygame.init()
     pygame.mixer.init()
 
-
     screen_size = 1280, 768
     pygame.display.set_mode((screen_size[0], screen_size[1]), pygame.SRCALPHA)
 
     clock = pygame.time.Clock()
-    active_scene = scenes[1].Begin()
+    active_scene = scenes[2].Begin()
 
     while active_scene != None:
 
